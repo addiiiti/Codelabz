@@ -1,43 +1,58 @@
-FROM node:14
+# Production-Ready Multi-Stage Dockerfile for Codelabz
+# This Dockerfile creates an optimized production build
 
-# Set the working directory in the container
+# ============================================
+# Stage 1: Builder
+# ============================================
+FROM node:20-alpine AS builder
+
 WORKDIR /app
 
-RUN apt update -y && apt install -y openjdk-11-jdk bash
-
-RUN npm install -g firebase-tools@11
-
-# Pre-download emulators
-RUN firebase setup:emulators:firestore && \
-    firebase setup:emulators:storage && \
-    firebase setup:emulators:database && \
-    firebase setup:emulators:pubsub && \
-    firebase setup:emulators:ui
-
-# Copy package.json and package-lock.json to the container
+# Copy package files first for better caching
 COPY package*.json ./
-COPY ./functions/package*.json ./functions/
 
-# Install the project dependencies
-RUN npm install
-RUN cd functions && npm install && cd ..
+# Install all dependencies once (including dev deps needed for build)
+# Using --legacy-peer-deps for React version conflicts
+# Using --ignore-scripts to skip husky (not needed in Docker)
+RUN npm install --legacy-peer-deps --ignore-scripts && \
+    npm cache clean --force
 
-# Copy the entire project directory to the container
+# Build-time variables for Vite — passed via --build-arg or Compose args:
+# these are declared here so Vite sees them as env vars during the build.
+# They are NOT persisted as image environment variables.
+ARG VITE_FIREBASE_API_KEY
+ARG VITE_FIREBASE_AUTH_DOMAIN
+ARG VITE_FIREBASE_PROJECT_ID
+ARG VITE_FIREBASE_STORAGE_BUCKET
+ARG VITE_FIREBASE_MESSAGING_SENDER_ID
+ARG VITE_FIREBASE_APP_ID
+
+# Copy application source
 COPY . .
 
-# Expose the desired port for the Node.js server
-EXPOSE 5173
-EXPOSE 4000
-EXPOSE 5000
-EXPOSE 5001
-EXPOSE 8080
-EXPOSE 9000
-EXPOSE 8085
-EXPOSE 9199
-EXPOSE 4400
+# Build the application
+RUN npm run build
 
-RUN mkdir -p scripts
-RUN echo '#!/bin/sh \nfirebase emulators:start --import=testdata --project demo-sampark &\nsleep 10\nnpm run dev --host &\nwait' > ./scripts/entrypoint.sh 
-RUN chmod +x ./scripts/entrypoint.sh
+# ============================================
+# Stage 2: Production (Nginx Server)
+# ============================================
+FROM nginx:alpine AS production
 
-CMD ["./scripts/entrypoint.sh"]
+# Install curl for healthcheck
+RUN apk add --no-cache curl
+
+# Copy nginx configuration
+COPY nginx.conf /etc/nginx/conf.d/default.conf
+
+# Copy built application from builder stage
+COPY --from=builder /app/dist /usr/share/nginx/html
+
+# Add healthcheck
+HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
+    CMD curl -f http://localhost/ || exit 1
+
+# Expose port 80
+EXPOSE 80
+
+# Start nginx in foreground
+CMD ["nginx", "-g", "daemon off;"]
